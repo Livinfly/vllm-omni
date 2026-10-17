@@ -117,6 +117,45 @@ class TestAttentionSpec:
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
         assert spec.backend_kwargs() == {"topk": 96}
 
+    def test_local_fastwan_tile64_config_round_trip(self):
+        config = AttentionConfig(per_role={"self": {"backend": "FASTVIDEO_VSA", "fastvideo_vsa_block_size": [4, 4, 4]}})
+        assert config.per_role["self"].backend_kwargs() == {"block_size": (4, 4, 4)}
+        assert AttentionSpec(backend="FASTVIDEO_VSA").backend_kwargs() is None
+
+    @pytest.mark.parametrize("size", [[4, 4], [4, 4, 0], [True, 8, 8], [2, 8, 8], "444"])
+    def test_local_fastwan_rejects_unsupported_tile(self, size):
+        with pytest.raises(ValueError, match="fastvideo_vsa_block_size"):
+            AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_block_size=size)
+
+    def test_local_fastwan_tile_requires_vsa(self):
+        with pytest.raises(ValueError, match="requires the FASTVIDEO_VSA"):
+            AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_block_size=(4, 4, 4))
+
+    def test_local_fastwan_ulysses_is_explicit_and_serialized(self):
+        config = AttentionConfig(
+            per_role={
+                "self": dict(
+                    backend="FASTVIDEO_VSA", fastvideo_vsa_block_size=[4, 4, 4], fastvideo_vsa_allow_ulysses=True
+                )
+            }
+        )
+        assert config.per_role["self"].backend_kwargs() == {"block_size": (4, 4, 4), "allow_ulysses": True}
+        assert not AttentionSpec(backend="FASTVIDEO_VSA").fastvideo_vsa_allow_ulysses
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(backend="TORCH_SDPA"),
+            dict(backend="FASTVIDEO_VSA"),
+            dict(backend="FASTVIDEO_VSA", fastvideo_vsa_block_size=[4, 8, 8]),
+            dict(backend="FASTVIDEO_VSA", fastvideo_vsa_block_size=[4, 4, 4], fastvideo_vsa_precision="sage"),
+            dict(backend="FASTVIDEO_VSA", fastvideo_vsa_block_size=[4, 4, 4], fastvideo_vsa_provider="flashinfer"),
+        ],
+    )
+    def test_local_fastwan_ulysses_rejects_incompatible_backend(self, kwargs):
+        with pytest.raises(ValueError, match="fastvideo_vsa_allow_ulysses"):
+            AttentionSpec(**kwargs, fastvideo_vsa_allow_ulysses=True)
+
     @pytest.mark.parametrize("provider", ["auto", "fastvideo", "flashinfer"])
     def test_vsa_provider_round_trip_preserves_explicit_selection(self, provider):
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider=provider)

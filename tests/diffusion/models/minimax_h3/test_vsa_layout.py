@@ -76,6 +76,35 @@ def _h3_impl(**backend_kwargs):
     return MiniMaxH3VSAImpl(num_heads=2, head_size=8, softmax_scale=8**-0.5, backend_kwargs=kwargs)
 
 
+@pytest.mark.parametrize(
+    ("blocks", "sparsity", "expected"),
+    [(660, 0.8, 132), (660, 0.9, 66), (8, 0.8, 2), (1, 0.8, 1), (660, 0.0, 660), (660, 1.0, 1)],
+)
+def test_h3_checkpoint_sparsity_controls_topk(blocks, sparsity, expected):
+    assert _h3_impl(topk=64).resolve_h3_topk(blocks, sparsity) == expected
+
+
+@pytest.mark.parametrize("sparsity", [-0.1, 1.1, float("nan"), float("inf")])
+def test_h3_rejects_invalid_checkpoint_sparsity(sparsity):
+    with pytest.raises(ValueError, match="sparsity"):
+        _h3_impl().resolve_h3_topk(660, sparsity)
+
+
+def test_h3_forward_uses_checkpoint_sparsity_over_backend_default(monkeypatch):
+    calls: dict[str, Any] = {}
+    _fake_block_sparse_kernel(monkeypatch, calls)
+    impl = _h3_impl(topk=64)
+    metadata = _h3_metadata((5,), (12, 4, 4))
+    metadata.extra["vsa_h3_sparsity"] = 0.8
+    query = torch.randn(1, 5 + 12 * 4 * 4, 2, 8, dtype=torch.bfloat16)
+    impl.forward_cuda(query, query, query, metadata)
+    block_map = calls["block_map"]
+    assert block_map[..., :1].all()
+    assert block_map[:, :, :1, :].all()
+    assert (block_map[:, :, 1:, 1:].sum(dim=-1) == 1).all()
+    assert impl.topk == 64, "request sparsity must not mutate the fallback configuration"
+
+
 def test_h3_forward_tiles_untiles_and_restores_the_original_row_order(monkeypatch):
     calls: dict[str, Any] = {}
     _fake_block_sparse_kernel(monkeypatch, calls)

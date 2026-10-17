@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
     FastVideoVSABackend,
     FastVideoVSAImpl,
+    validate_local_ulysses_config,
 )
 from vllm_omni.diffusion.attention.backends.registry import (
     DiffusionAttentionBackendEnum,
@@ -224,6 +225,75 @@ def test_fastvideo_vsa_allows_topk_equal_to_num_blocks():
     assert too_many._fallback_reason(query, query, query, metadata) == "topk 3 > num_blocks 2"
 
 
+@pytest.mark.parametrize("learned_gate", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_local_fastwan_tile64_layout_gate_and_edge_padding(monkeypatch, learned_gate, packed):
+    fake_module = types.ModuleType("fastvideo_kernel")
+    calls = []
+
+    def fake_video_sparse_attn(q, k, v, **kwargs):
+        calls.append(kwargs)
+        assert q.shape == k.shape == v.shape == (2, 3, 576, 8)
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        assert kwargs["block_size"] == (4, 4, 4) and kwargs["topk"] == 2
+        sizes = kwargs["variable_block_sizes"]
+        assert sizes.tolist() == [48, 48, 24, 48, 48, 24, 24, 24, 12]
+        torch.testing.assert_close(sizes, kwargs["q_variable_block_sizes"])
+        gate = kwargs["compress_attn_weight"]
+        assert gate.shape == q.shape
+        padding = torch.arange(64)[None, :] >= sizes[:, None]
+        for tensor in (q, k, v, gate):
+            assert torch.count_nonzero(tensor.reshape(2, 3, 9, 64, 8)[:, :, padding]) == 0
+        return q + 2 * k + 3 * v + gate
+
+    fake_module.video_sparse_attn = fake_video_sparse_attn
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel", fake_module)
+    impl = FastVideoVSAImpl(
+        num_heads=3,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"block_size": (4, 4, 4), "topk": 2, "min_seq_len": 1, "fallback_on_error": False},
+    )
+    valid = 300
+    query, key, value, gate = [torch.randn(2, 320 if packed else valid, 3, 8) for _ in range(4)]
+    extra = {"vsa_dit_seq_shape": (3, 10, 10)}
+    if learned_gate:
+        extra["gate_compress"] = gate
+    padding = (
+        PackedPaddingMetadata(
+            q_length=valid,
+            kv_length=valid,
+            cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+        )
+        if packed
+        else None
+    )
+    metadata = AttentionMetadata(extra=extra, packed_padding=padding)
+    # Exercise real tiling and the custom op on CPU, bypassing CUDA-only admission.
+    monkeypatch.setattr(impl, "_fallback_reason", lambda *args: None)
+    output = impl.forward_cuda(query, key, value, metadata)
+    expected = query[:, :valid] + 2 * key[:, :valid] + 3 * value[:, :valid]
+    if learned_gate:
+        expected = expected + gate[:, :valid]
+    torch.testing.assert_close(output[:, :valid], expected)
+    assert output.shape == query.shape and len(calls) == 1
+    assert torch.count_nonzero(output[:, valid:]) == 0
+
+
+@pytest.mark.parametrize("tile, reason", [((4, 4, 4), "dtype"), ((2, 8, 8), "block_elements")])
+def test_local_fastwan_tile64_admission(tile, reason):
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"block_size": tile, "topk": 1, "min_seq_len": 1},
+    )
+    query = torch.randn(1, 300, 2, 8)
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (3, 10, 10)})
+    assert impl._fallback_reason(query, query, query, metadata).startswith(reason)
+
+
 def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
     # The backend advertises supports_packed_mask_free, so a model may skip
     # building the padding mask. Every fallback out of the VSA path must honour
@@ -256,3 +326,124 @@ def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
     assert baseline.shape == query.shape
     torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
     assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
+def _local_ulysses_impl(monkeypatch, degree):
+    from vllm_omni.diffusion import config
+    from vllm_omni.diffusion.attention.backends import fastvideo_vsa
+
+    monkeypatch.setattr(config, "get_current_diffusion_config_or_none", lambda: None)
+    parallel = types.SimpleNamespace(ulysses_degree=degree, sequence_parallel_size=degree)
+    ctx = types.SimpleNamespace(
+        omni_diffusion_config=types.SimpleNamespace(parallel_config=parallel),
+        sp_active=degree > 1,
+        sp_padding_size=0,
+    )
+    monkeypatch.setattr(fastvideo_vsa, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(fastvideo_vsa, "is_forward_context_available", lambda: True)
+    impl = FastVideoVSAImpl(
+        num_heads=40,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        backend_kwargs={"block_size": (4, 4, 4), "allow_ulysses": True, "topk": 2},
+    )
+    return impl, ctx
+
+
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_local_ulysses_accepts_full_sequence_local_heads(monkeypatch, degree):
+    impl, _ = _local_ulysses_impl(monkeypatch, degree)
+    query = torch.zeros(1, 512, 40 // degree, 128)
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (4, 8, 16), "gate_compress": query})
+    impl._validate_ulysses_inputs(query, metadata)
+    assert not impl.fallback_on_error
+    with pytest.raises(ValueError, match="refuses dense fallback"):
+        impl._fallback(query, query, query, metadata, "test")
+
+
+def test_local_ulysses_keeps_default_sp_fallback(monkeypatch):
+    from vllm_omni.diffusion.attention.backends import fastvideo_vsa
+
+    monkeypatch.setattr(fastvideo_vsa, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fastvideo_vsa, "get_forward_context", lambda: types.SimpleNamespace(sp_active=True))
+    impl = FastVideoVSAImpl(
+        num_heads=40, head_size=128, softmax_scale=128**-0.5, backend_kwargs={"block_size": (4, 4, 4), "topk": 2}
+    )
+    # Admission only reads tensor properties; no CUDA allocation is needed.
+    query = types.SimpleNamespace(ndim=4, shape=(1, 512, 20, 128), dtype=torch.bfloat16, device=torch.device("cuda"))
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (4, 8, 16)})
+    assert impl._fallback_reason(query, query, query, metadata) == "sequence parallel context is active"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("ring_degree", 2),
+        ("allgather_degree", 2),
+        ("tensor_parallel_size", 2),
+        ("cfg_parallel_size", 2),
+        ("pipeline_parallel_size", 2),
+        ("data_parallel_size", 2),
+        ("use_hsdp", True),
+        ("ulysses_mode", "advanced_uaa"),
+        ("sequence_parallel_size", 4),
+        ("ulysses_degree", 3),
+    ],
+)
+def test_local_ulysses_rejects_unsupported_topology(field, value):
+    parallel = types.SimpleNamespace(ulysses_degree=2, sequence_parallel_size=2)
+    setattr(parallel, field, value)
+    with pytest.raises(ValueError, match="Local FastWan"):
+        validate_local_ulysses_config(parallel)
+
+
+def test_local_ulysses_rejects_ring_before_attention_dispatch(monkeypatch):
+    from vllm_omni.diffusion import config
+
+    parallel = types.SimpleNamespace(ulysses_degree=2, sequence_parallel_size=4, ring_degree=2)
+    monkeypatch.setattr(
+        config, "get_current_diffusion_config_or_none", lambda: types.SimpleNamespace(parallel_config=parallel)
+    )
+    with pytest.raises(ValueError, match="ring_degree"):
+        FastVideoVSAImpl(
+            num_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            backend_kwargs={"block_size": (4, 4, 4), "allow_ulysses": True},
+        )
+
+
+@pytest.mark.parametrize("invalid", ["padding", "local_sequence", "global_heads", "local_gate", "inactive"])
+def test_local_ulysses_rejects_incorrect_communication_contract(monkeypatch, invalid):
+    impl, ctx = _local_ulysses_impl(monkeypatch, 2)
+    query = torch.zeros(1, 512, 20, 128)
+    gate = query
+    if invalid == "padding":
+        ctx.sp_padding_size = 1
+    elif invalid == "local_sequence":
+        query = query[:, :256]
+    elif invalid == "global_heads":
+        query = torch.zeros(1, 512, 40, 128)
+    elif invalid == "local_gate":
+        gate = gate[:, :256]
+    elif invalid == "inactive":
+        ctx.sp_active = False
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (4, 8, 16), "gate_compress": gate})
+    with pytest.raises(ValueError, match="Local FastWan"):
+        impl._validate_ulysses_inputs(query, metadata)
+
+
+def test_local_ulysses_kernel_errors_are_not_retried_with_dense(monkeypatch):
+    from vllm_omni.diffusion.attention.backends import fastvideo_vsa
+
+    impl, _ = _local_ulysses_impl(monkeypatch, 2)
+    query = torch.zeros(1, 512, 20, 128)
+    metadata = AttentionMetadata(extra={"vsa_dit_seq_shape": (4, 8, 16), "gate_compress": query})
+    monkeypatch.setattr(impl, "_fallback_reason", lambda *args: None)
+
+    def fail(*args):
+        raise RuntimeError("kernel sentinel")
+
+    monkeypatch.setattr(fastvideo_vsa, "_fastvideo_vsa_bshd_op", fail)
+    with pytest.raises(RuntimeError, match="kernel sentinel"):
+        impl.forward_cuda(query, query, query, metadata)

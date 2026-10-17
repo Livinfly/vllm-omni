@@ -13,6 +13,8 @@ import torch.nn as nn
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
     FASTH3_BASE_MODEL,
+    FASTH3_V1_BASE_SCHEDULE,
+    FASTH3_V1_MODEL_ID,
     FASTH3_V2_BASE_SCHEDULE,
     FASTH3_V2_MODEL_ID,
     FastH3CheckpointSpec,
@@ -677,3 +679,54 @@ def test_resolve_sigma_positions_uses_release_metadata_schedule():
     assert steps == 8 == len(positions) - 1
     with pytest.raises(OmniClientError, match="must be 8"):
         pipeline._resolve_sigma_positions("t2va", _sampling(num_inference_steps=9))
+
+
+def _v1_metadata():
+    metadata = _fastvideo_metadata()
+    metadata.update(
+        model_id=FASTH3_V1_MODEL_ID,
+        transformer_forwards=4,
+        num_inference_steps=5,
+        dmd_denoising_steps=[999, 749, 500, 250],
+        vsa_sparsity=0.9,
+    )
+    metadata.pop("video_scheduler_shift")
+    metadata.pop("audio_scheduler_shift")
+    return metadata
+
+
+def test_v1_contract_uses_four_forwards_and_its_own_shifted_schedule():
+    spec = FastH3CheckpointSpec.from_metadata(_v1_metadata())
+    assert spec.label == "FastH3 V1"
+    assert spec.num_inference_steps == 4
+    assert spec.vsa_sparsity == 0.9
+    assert spec.base_schedule == FASTH3_V1_BASE_SCHEDULE
+    assert spec.release_metadata()["sigma_shift_scales"] == {"video": 12.0, "audio": 3.0}
+    assert spec.base_schedule.shifted_sigmas(12) == pytest.approx(
+        [12 * u / (1 + 11 * u) for u in [0.999, 0.749, 0.5, 0.25, 0]]
+    )
+    sample = _sampling(num_inference_steps=4, extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0})
+    spec.check_request(sample)
+    spec.check_request(sample, step_execution=True)
+    with pytest.raises(OmniClientError, match="num_inference_steps=4"):
+        spec.check_request(_sampling(num_inference_steps=5))
+    with pytest.raises(OmniClientError, match="flow_shift=12"):
+        spec.check_request(_sampling(num_inference_steps=4, extra_args={"flow_shift": 10.0}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_inference_steps", 4),
+        ("transformer_forwards", 5),
+        ("dmd_denoising_steps", [999, 750, 500, 250]),
+        ("vsa_sparsity", 0.8),
+        ("video_scheduler_shift", 10.0),
+        ("audio_scheduler_shift", 4.0),
+    ],
+)
+def test_v1_rejects_metadata_drift(field, value):
+    metadata = _v1_metadata()
+    metadata[field] = value
+    with pytest.raises(ValueError, match=field):
+        FastH3CheckpointSpec.from_metadata(metadata)

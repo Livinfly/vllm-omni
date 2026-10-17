@@ -1008,7 +1008,12 @@ class MiniMaxH3Pipeline(
         if self._fasth3_checkpoint is not None:
             self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)
             logger.info(
-                "FastH3 V2 full checkpoint: 8 transformer forwards, video/audio shifts 10/3, VSA sparsity=0.8 tile=64"
+                "%s full checkpoint: %d transformer forwards, video/audio shifts %g/%g, VSA sparsity=%g tile=64",
+                self._fasth3_checkpoint.label,
+                self._fasth3_checkpoint.num_inference_steps,
+                self._fasth3_checkpoint.video_shift,
+                self._fasth3_checkpoint.audio_shift,
+                self._fasth3_checkpoint.vsa_sparsity,
             )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
@@ -1231,7 +1236,9 @@ class MiniMaxH3Pipeline(
                 f"blocks.{i}.attn.to_gate_compress.weight" for i in range(self.transformer.arch.num_layers)
             }
             if missing_gates := required_gates - transformer_loaded:
-                raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
+                raise ValueError(
+                    f"{self._fasth3_checkpoint.label} checkpoint is missing compression gates: {sorted(missing_gates)}"
+                )
         return loaded_with_prefix
 
     @property

@@ -1,0 +1,38 @@
+{
+  "name": "fasth3_v2",
+  "model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
+  "sampling": {
+    "height": 768,
+    "width": 1344,
+    "num_frames": 124,
+    "fps": 24,
+    "seed": 1000,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 8
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "contract": {
+    "dmd_denoising_steps": [
+      999,
+      874,
+      749,
+      624,
+      500,
+      375,
+      250,
+      125
+    ],
+    "video_shift": 10.0,
+    "audio_shift": 3.0
+  },
+  "adapter": "minimax_h3_v2",
+  "engine": {},
+  "attention": {
+    "backend": "FASTVIDEO_VSA",
+    "provider": "fastvideo",
+    "precision": "bf16",
+    "checkpoint_sparsity": 0.8,
+    "tile_size": 64
+  }
+}

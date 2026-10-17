@@ -1,0 +1,43 @@
+{
+  "name": "fasth3_v1_offload",
+  "model_id": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+  "sampling": {
+    "height": 768,
+    "width": 1344,
+    "num_frames": 124,
+    "fps": 24,
+    "seed": 1000,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 4
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "contract": {
+    "dmd_denoising_steps": [
+      999,
+      749,
+      500,
+      250
+    ],
+    "video_shift": 12.0,
+    "audio_shift": 3.0
+  },
+  "adapter": "minimax_h3_v1",
+  "engine": {
+    "diffusion_offload_config": {
+      "mode": "layer",
+      "components": [
+        "dit",
+        "text_encoder"
+      ]
+    }
+  },
+  "attention": {
+    "backend": "FASTVIDEO_VSA",
+    "provider": "fastvideo",
+    "precision": "bf16",
+    "checkpoint_sparsity": 0.9,
+    "tile_size": 64
+  },
+  "execution_note": "非默认：启用 Omni 原生 DiT 和文本编码器按层 CPU offload；逐层传输采用原生 rank-local 默认，pin_memory 沿用默认 true。原因：同规模 V2 默认无 offload 的 8 卡组在加载文本编码器时已占用 94.90 GiB / 95 GiB 并 OOM；V1 使用同规模 DiT/TE，采用相同内存策略为激活及 VAE 留空间。V1 未单独测试默认配置 OOM。8/4/2/1 卡统一使用本配置；模型、输入、4 次 DiT、shift 12/3、稀疏率 0.9（本形状 topk66）、精度和并行拓扑保持对齐；E2E/DiT 包含 offload 传输成本。"
+}

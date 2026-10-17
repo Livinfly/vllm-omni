@@ -1,0 +1,47 @@
+{
+  "name": "fasth3_v2_offload",
+  "model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
+  "sampling": {
+    "height": 768,
+    "width": 1344,
+    "num_frames": 124,
+    "fps": 24,
+    "seed": 1000,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 8
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "contract": {
+    "dmd_denoising_steps": [
+      999,
+      874,
+      749,
+      624,
+      500,
+      375,
+      250,
+      125
+    ],
+    "video_shift": 10.0,
+    "audio_shift": 3.0
+  },
+  "adapter": "minimax_h3_v2",
+  "engine": {
+    "diffusion_offload_config": {
+      "mode": "layer",
+      "components": [
+        "dit",
+        "text_encoder"
+      ]
+    }
+  },
+  "attention": {
+    "backend": "FASTVIDEO_VSA",
+    "provider": "fastvideo",
+    "precision": "bf16",
+    "checkpoint_sparsity": 0.8,
+    "tile_size": 64
+  },
+  "execution_note": "非默认：启用 Omni 原生 DiT 和文本编码器按层 CPU offload（默认无 offload）；逐层传输采用原生 rank-local 默认，pin_memory 沿用默认 true。原因：2026-10-16 默认配置的 8 卡组在 rank0 加载文本编码器时已占用 94.90 GiB / 95 GiB，再申请 100 MiB 触发 CUDA OOM，warmup 尚未开始。按层卸载降低 DiT/TE 同时驻留及推理峰值，给激活和 VAE 留出空间，并用于 8/4/2/1 卡同一配方。模型、输入、采样、精度、VSA/topk、并行拓扑和其余执行选项保持原配方；E2E/DiT 按原计时边界包含 offload 传输成本。失败证据：outputs/benchmarks/portable_fasth3_native_20261016/fasth3_v2/g8/error_rank0.json。"
+}

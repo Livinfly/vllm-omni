@@ -4,6 +4,10 @@ This directory contains benchmark suites for evaluating different model families
 
 ## Benchmark families
 
+### [Video Generation](video_generation/README.md) — Portable FastH3 V2 Timing
+
+Offline native FastH3 V2 matrix with GPU admission/locks, complete DiT CUDA events, generation/mux/save E2E, background state, monitoring and per-model reports. Includes verified local VAE preparation and checkpoint-sparsity VSA topk alignment.
+
 ### [Qwen2.5-Omni](qwen2_5_omni/README.md) — Embedding Wrapper Latency
 
 CPU-observed A/B timings for redundant text embedding removal, with real checkpoint

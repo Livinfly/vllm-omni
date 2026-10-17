@@ -2087,6 +2087,10 @@ class AttentionSpec:
     fastvideo_vsa_precision: str = "bf16"
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    # Local adaptation: expose the FastWan tile64 route without changing defaults.
+    fastvideo_vsa_block_size: tuple[int, int, int] | None = None
+    # Local FastWan adaptation; upstream/default SP behavior remains unchanged.
+    fastvideo_vsa_allow_ulysses: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
@@ -2119,6 +2123,29 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.fastvideo_vsa_block_size is not None:
+            size = self.fastvideo_vsa_block_size
+            if self.backend.upper() != "FASTVIDEO_VSA":
+                raise ValueError("fastvideo_vsa_block_size requires the FASTVIDEO_VSA backend.")
+            if (
+                not isinstance(size, (tuple, list))
+                or len(size) != 3
+                or any(type(dim) is not int or dim <= 0 for dim in size)
+                or math.prod(size) not in (64, 256)
+            ):
+                raise ValueError(
+                    "fastvideo_vsa_block_size must contain three positive integers with product 64 or 256."
+                )
+            self.fastvideo_vsa_block_size = tuple(size)
+        if type(self.fastvideo_vsa_allow_ulysses) is not bool:
+            raise ValueError("fastvideo_vsa_allow_ulysses must be a bool")
+        if self.fastvideo_vsa_allow_ulysses and (
+            self.backend.upper() != "FASTVIDEO_VSA"
+            or self.fastvideo_vsa_block_size != (4, 4, 4)
+            or self.fastvideo_vsa_provider not in ("auto", "fastvideo")
+            or self.fastvideo_vsa_precision != "bf16"
+        ):
+            raise ValueError("fastvideo_vsa_allow_ulysses requires FASTVIDEO_VSA FastVideo BF16/(4,4,4)")
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -2167,6 +2194,10 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.fastvideo_vsa_block_size is not None:
+            kw["block_size"] = self.fastvideo_vsa_block_size
+        if self.fastvideo_vsa_allow_ulysses:
+            kw["allow_ulysses"] = True
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -2252,6 +2283,8 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "fastvideo_vsa_block_size",
+            "fastvideo_vsa_allow_ulysses",
             "block_sparse",
         }
         node_dict = dict(node)

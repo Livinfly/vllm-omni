@@ -1,0 +1,37 @@
+{
+  "name": "fastwan21_14b",
+  "adapter": "fastwan21_14b",
+  "model_id": "FastVideo/FastWan2.1-T2V-14B-Diffusers",
+  "sampling": {
+    "height": 720,
+    "width": 1280,
+    "num_frames": 81,
+    "fps": 16,
+    "seed": 1024,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 3
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "engine": {
+    "engine_backend": "fastwan_engine.FastWanBenchmarkEngine"
+  },
+  "contract": {
+    "dmd_denoising_steps": [
+      1000,
+      757,
+      522
+    ],
+    "flow_shift": 8.0
+  },
+  "execution_note": "我们自行适配：tile (4,4,4)/64 tokens 覆盖 Omni 默认 (4,8,8)，并显式启用 strict Ulysses VSA，匹配 FastVideo/SGLang 的 1440 块、topk144；仅支持 G1/G2/G4/G8、无 SP padding，self-attention 失败直接报错，禁止 dense 回退。沿用本机现有 benchmark 的 FASTVIDEO_VSA_TRITON=1，使所有卡数使用已验证的同一 kernel 路径，此为非默认选择。其余保留 Omni 默认：无 CPU/layerwise offload、compile 开启、prompt cache 关闭、VAE tiling/slicing 关闭；VAE 参数及解码为 BF16，与 FV/SG 的 FP32 参数存储不同，VAE lossless fast path 默认保留。cross-attention 使用平台原生默认后端，加载后逐 rank 记录。每组 warmup 一次、正式测量一次；不生成音频。 环境沿用 CUDA 13 compatibility 库以匹配当前 cu130 PyTorch；正式启动时通过 BENCH_CUDA_COMPAT 指定。 我们自行适配的 fastwan_engine.FastWanBenchmarkEngine 通过原生 engine_backend 扩展跳过额外的小尺寸启动 dummy run：默认 512x512/单帧仅有 64 个 VSA 块，与固定 topk144 不兼容；由 benchmark 脚本执行一次完整 720p/81帧/3步 warmup，再测量一次。正式请求的 topk、采样、原生推理和计时逻辑不变。",
+  "attention": {
+    "backend": "FASTVIDEO_VSA",
+    "provider": "fastvideo",
+    "precision": "bf16",
+    "checkpoint_sparsity": 0.9,
+    "tile_size": 64,
+    "topk": 144,
+    "allow_ulysses": true
+  }
+}

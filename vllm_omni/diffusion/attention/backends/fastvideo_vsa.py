@@ -44,6 +44,24 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_vsa_bshd"):
         block_h: int,
         block_w: int,
     ) -> torch.Tensor:
+        # Local adaptation for our FastWan tile64 benchmarks: reuse FastVideo's
+        # existing BHSD kernel, converting Q/K/V and the learned gate together.
+        # Keep the original BSHD entrypoint for 256-token tiles.
+        if block_t * block_h * block_w == 64:
+            from fastvideo_kernel import video_sparse_attn
+
+            output = video_sparse_attn(
+                query.transpose(1, 2).contiguous(),
+                key.transpose(1, 2).contiguous(),
+                value.transpose(1, 2).contiguous(),
+                variable_block_sizes=variable_block_sizes,
+                q_variable_block_sizes=q_variable_block_sizes,
+                topk=topk,
+                block_size=(block_t, block_h, block_w),
+                compress_attn_weight=(compress_attn_weight.transpose(1, 2) if compress_attn_weight.numel() else None),
+            )
+            return output.transpose(1, 2).contiguous()
+
         from fastvideo_kernel import video_sparse_attn_bshd
 
         return video_sparse_attn_bshd(
@@ -111,6 +129,30 @@ def _preserve_vsa_all_blocks(attn_metadata: AttentionMetadata | None) -> bool:
     return attn_metadata.extra.get("preserve_vsa_all_blocks") is True
 
 
+def validate_local_ulysses_config(parallel_config: Any) -> int:
+    """Local FastWan adaptation: admit only the topology we test, including G1."""
+    degree = getattr(parallel_config, "ulysses_degree", None)
+    if type(degree) is not int or degree not in (1, 2, 4, 8):
+        raise ValueError("Local FastWan VSA requires ulysses_degree in 1/2/4/8")
+    for name in (
+        "ring_degree",
+        "allgather_degree",
+        "tensor_parallel_size",
+        "cfg_parallel_size",
+        "pipeline_parallel_size",
+    ):
+        if getattr(parallel_config, name, 1) != 1:
+            raise ValueError(f"Local FastWan VSA requires {name}=1")
+    if (
+        getattr(parallel_config, "sequence_parallel_size", None) != degree
+        or getattr(parallel_config, "ulysses_mode", "strict") != "strict"
+        or getattr(parallel_config, "data_parallel_size", 1) not in (None, 1)
+        or getattr(parallel_config, "use_hsdp", False)
+    ):
+        raise ValueError("Local FastWan VSA requires strict pure Ulysses without DP/HSDP")
+    return degree
+
+
 class FastVideoVSABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -151,6 +193,7 @@ class FastVideoVSABackend(AttentionBackend):
 
 
 class FastVideoVSAImpl(AttentionImpl):
+    # H3/FlashInfer provider selection; independent of our FastVideo tile64 route.
     _supports_tile64_provider = False
 
     def __init__(
@@ -193,6 +236,21 @@ class FastVideoVSAImpl(AttentionImpl):
         self.min_seq_len = int(backend_kwargs.get("min_seq_len", self.block_elements * 2))
         self.fallback_on_error = bool(backend_kwargs.get("fallback_on_error", True))
         self.disable_when_sp_active = bool(backend_kwargs.get("disable_when_sp_active", True))
+        # Our opt-in FastWan Ulysses adaptation reuses native all-to-all and
+        # tile64 kernels. Fail closed so dense fallback cannot fake VSA results.
+        self.allow_ulysses = backend_kwargs.get("allow_ulysses", False)
+        if type(self.allow_ulysses) is not bool:
+            raise ValueError("allow_ulysses must be a bool")
+        if self.allow_ulysses:
+            if self.provider != "fastvideo" or self.precision != "bf16" or self.block_elements != 64:
+                raise ValueError("Local FastWan Ulysses requires FastVideo BF16/tile64")
+            from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+
+            config = get_current_diffusion_config_or_none()
+            if config is not None:
+                # Validate at construction too: Ring can bypass this backend's forward.
+                validate_local_ulysses_config(config.parallel_config)
+            self.fallback_on_error = False
 
         self.sdpa_fallback = SDPAImpl(
             num_heads=num_heads,
@@ -203,10 +261,9 @@ class FastVideoVSAImpl(AttentionImpl):
             qkv_layout=qkv_layout,
         )
 
-        if self.block_elements != 256:
+        if self.block_elements not in (64, 256):
             logger.warning(
-                "FASTVIDEO_VSA currently uses fastvideo_kernel.video_sparse_attn_bshd, "
-                "which supports only 256-token blocks. Configured block_size=%s "
+                "FASTVIDEO_VSA currently supports 64- or 256-token blocks. Configured block_size=%s "
                 "(product=%d) will fall back to SDPA.",
                 self.block_size,
                 self.block_elements,
@@ -235,6 +292,8 @@ class FastVideoVSAImpl(AttentionImpl):
         the structural pad rows as real keys. Slice to the valid prefix instead
         and leave the pad rows zeroed, exactly as the VSA path does.
         """
+        if self.allow_ulysses:
+            raise ValueError(f"Local FastWan VSA refuses dense fallback: {reason}")
         logger.warning_once("FASTVIDEO_VSA falling back to SDPA: %s", reason)
         packed = attn_metadata.packed_padding if attn_metadata is not None else None
         if attn_metadata is None or packed is None or attn_metadata.attn_mask is not None:
@@ -265,8 +324,8 @@ class FastVideoVSAImpl(AttentionImpl):
             return "FlashInfer VSA requires a model tile64 layout"
         if self.causal:
             return "causal attention is not supported"
-        if self.block_elements != 256:
-            return f"block_elements must be 256, got {self.block_elements}"
+        if self.block_elements not in (64, 256):
+            return f"block_elements must be 64 or 256, got {self.block_elements}"
         if self.topk <= 0:
             return f"topk must be positive, got {self.topk}"
         if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
@@ -304,11 +363,29 @@ class FastVideoVSAImpl(AttentionImpl):
             return "piecewise/full attention spans are not supported"
         if self.num_heads != self.num_kv_heads:
             return "GQA/MQA is not supported"
-        if self.disable_when_sp_active and is_forward_context_available():
+        if self.disable_when_sp_active and not self.allow_ulysses and is_forward_context_available():
             ctx = get_forward_context()
             if getattr(ctx, "sp_active", False):
                 return "sequence parallel context is active"
         return None
+
+    def _validate_ulysses_inputs(self, query: torch.Tensor, attn_metadata: AttentionMetadata | None) -> None:
+        if not is_forward_context_available():
+            raise ValueError("Local FastWan VSA requires a forward context")
+        ctx = get_forward_context()
+        degree = validate_local_ulysses_config(ctx.omni_diffusion_config.parallel_config)
+        if degree > 1 and not ctx.sp_active:
+            raise ValueError("Local FastWan VSA requires an active Ulysses region")
+        if ctx.sp_padding_size or (attn_metadata is not None and attn_metadata.packed_padding is not None):
+            raise ValueError("Local FastWan Ulysses does not support SP/packed padding")
+        grid = _get_vsa_dit_seq_shape(attn_metadata)
+        if grid is None or query.ndim != 4 or math.prod(grid) != query.shape[1]:
+            raise ValueError("Local FastWan VSA requires the full video sequence after all-to-all")
+        if self.num_heads % degree or query.shape[2:] != (self.num_heads // degree, self.head_size):
+            raise ValueError("Local FastWan VSA requires the expected local head shard after all-to-all")
+        gate = _get_gate_compress(attn_metadata)
+        if gate is None or gate.shape != query.shape:
+            raise ValueError("Local FastWan VSA requires gate_compress to follow the Q all-to-all")
 
     def forward_cuda(
         self,
@@ -317,6 +394,8 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if self.allow_ulysses:
+            self._validate_ulysses_inputs(query, attn_metadata)
         original_query, original_key, original_value = query, key, value
         original_seq_len = query.shape[1]
         valid_seq_len = original_seq_len

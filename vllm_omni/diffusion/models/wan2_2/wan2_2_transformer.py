@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -1243,8 +1244,24 @@ class WanTransformer3DModel(nn.Module):
         loaded_params: set[str] = set()
         loaded_qkv_shards: dict[str, set[str]] = {}
         qkv_smooth_scales: dict[str, torch.Tensor] = {}
+        source_priorities: dict[str, int] = {}
 
         for name, loaded_weight in weights:
+            # Our FastWan adaptation: its published checkpoint mixes FastVideo
+            # names (including biases) with Diffusers aliases. Prefer FastVideo
+            # tensors regardless of shard iteration order, matching that model.
+            checkpoint_name = name
+            name = re.sub(r"^(blocks\.\d+)\.to_(q|k|v|out)\.", r"\1.attn1.to_\2.", name)
+            name = name.replace(".ffn.fc_in.", ".ffn.net.0.proj.")
+            name = name.replace(".ffn.fc_out.", ".ffn.net.2.")
+            priority = int(
+                name != checkpoint_name or re.match(r"^blocks\.\d+\.attn2\.to_out\.(weight|bias)$", name) is not None
+            )
+            name = name.replace(".to_out.0.", ".to_out.")
+            name = name.replace(".ffn.net.0.", ".ffn.net_0.").replace(".ffn.net.2.", ".ffn.net_2.")
+            if source_priorities.get(name, -1) > priority:
+                continue
+            source_priorities[name] = priority
             name = weight_name_remapping.get(name, name)
             original_name = name
             lookup_name = name
@@ -1269,7 +1286,7 @@ class WanTransformer3DModel(nn.Module):
                         qkv_smooth_scales[lookup_name] = loaded_weight.clone()
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(original_name)
+                loaded_params.update((checkpoint_name, original_name))
                 if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
                     # Shared input-channel Smooth is a complete tensor even
                     # when supplied under a single Q/K/V source name.
@@ -1281,6 +1298,9 @@ class WanTransformer3DModel(nn.Module):
                         loaded_params.add(lookup_name)
                 break
             else:
+                # FastVideo's Wan checkpoints keep the learned VSA gate on
+                # the block; Omni owns it inside self-attention.
+                lookup_name = re.sub(r"^(blocks\.\d+)\.to_gate_compress\.", r"\1.attn1.to_gate_compress.", lookup_name)
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
                 if ".ffn.net.0." in lookup_name:
                     lookup_name = lookup_name.replace(".ffn.net.0.", ".ffn.net_0.")
@@ -1327,6 +1347,6 @@ class WanTransformer3DModel(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.update((original_name, lookup_name))
+                loaded_params.update((checkpoint_name, original_name, lookup_name))
 
         return loaded_params

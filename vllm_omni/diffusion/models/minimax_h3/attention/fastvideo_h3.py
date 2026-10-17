@@ -84,6 +84,16 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
 
     _supports_tile64_provider = True
 
+    def resolve_h3_topk(self, video_blocks: int, sparsity: float | None = None) -> int:
+        """Match FastVideo's video-only keep count; prefix blocks remain dense."""
+        if video_blocks <= 0:
+            raise ValueError("VSA-H3 requires at least one video block")
+        if sparsity is None:
+            return min(self.topk, video_blocks)
+        if not math.isfinite(sparsity) or not 0 <= sparsity <= 1:
+            raise ValueError(f"Invalid VSA-H3 sparsity: {sparsity}")
+        return max(1, min(math.ceil((1 - sparsity) * video_blocks), video_blocks))
+
     def _forward_h3(
         self,
         query: torch.Tensor,
@@ -129,7 +139,8 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         q_pool = mean_pool_tiles(q_tiled[:, : logical_blocks * 64], sizes, block_size=64)
         k_pool = mean_pool_tiles(k_tiled[:, : logical_blocks * 64], sizes, block_size=64)
         scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * self.softmax_scale
-        block_map = build_prefix_dense_block_map(scores, prefix_blocks, video_blocks, self.topk)
+        topk = self.resolve_h3_topk(video_blocks, attn_metadata.extra.get("vsa_h3_sparsity"))
+        block_map = build_prefix_dense_block_map(scores, prefix_blocks, video_blocks, topk)
         logger.info_once(
             "FASTVIDEO_VSA H3 routing: seq_len=%d, prefix_segments=%s, video_shape=%s, "
             "prefix_blocks=%d, video_blocks=%d, topk=%d, logical_blocks=%d",
@@ -138,7 +149,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             video_shape,
             prefix_blocks,
             video_blocks,
-            min(self.topk, video_blocks),
+            topk,
             logical_blocks,
         )
         output = block_sparse_attn_bshd(
