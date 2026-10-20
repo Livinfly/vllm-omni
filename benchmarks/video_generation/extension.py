@@ -13,6 +13,7 @@ from common import write_json
 from gpu_wait import check_device_identity
 from runtime import serializable
 from timing import DiTEvents
+from sparse_attention import enabled as sparse_enabled
 
 
 def attention_info(transformer, native_shape, expected_sparsity=0.8):
@@ -199,6 +200,7 @@ class TimingExtension:
             torch.accelerator.synchronize()  # OUTSIDE response/distributed E2E.
             durations = self._bench_timer.elapsed_ms() if self._bench_mode == "dit" else None
             return dict(
+                sparse_attention=self._bench_timer.sparse_result() if self._bench_mode == "dit" and sparse_enabled() else None,
                 rank=self.rank,
                 response_e2e_s=response_s if self.rank == 0 else None,
                 distributed_e2e_s=distributed_s,
